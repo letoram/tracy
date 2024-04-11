@@ -5,6 +5,7 @@ option(GTK_FILESELECTOR "Use the GTK file selector on Linux instead of the xdg-p
 option(LEGACY "Instead of Wayland, use the legacy X11 backend on Linux" OFF)
 option(NO_ISA_EXTENSIONS "Disable ISA extensions (don't pass -march=native or -mcpu=native to the compiler)" OFF)
 option(NO_STATISTICS "Disable calculation of statistics" OFF)
+option(USE_ARCAN "Use Arcan as profiler backend" OFF)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/version.cmake)
 
@@ -96,7 +97,15 @@ set(PROFILER_FILES
 set(INCLUDES "")
 set(LIBS "")
 
-if(USE_WAYLAND)
+if(USE_ARCAN)
+    pkg_check_modules(ARCAN REQUIRED arcan-shmif arcan-shmif-ext egl)
+		set(INCLUDES "${INCLUDES};${CMAKE_CURRENT_BINARY_DIR};${ARCAN_INCLUDE_DIRS}")
+    set(LIBS "${LIBS};${ARCAN_LIBRARIES}")
+    set(PROFILER_FILES ${PROFILER_FILES}
+        src/BackendArcan.cpp
+    )
+
+elseif(USE_WAYLAND)
     pkg_check_modules(WAYLAND REQUIRED egl wayland-egl wayland-cursor xkbcommon)
     set(INCLUDES "${INCLUDES};${CMAKE_CURRENT_BINARY_DIR}")
     set(LIBS "${LIBS};${WAYLAND_LIBRARIES}")
@@ -161,8 +170,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE TracyServer TracyImGui)
 
 if(NOT EMSCRIPTEN)
     target_link_libraries(${PROJECT_NAME} PRIVATE TracyNfd)
-    if (NOT USE_WAYLAND)
-        target_link_libraries(${PROJECT_NAME} PRIVATE TracyGlfw3)
+    if (NOT USE_WAYLAND AND NOT USE_ARCAN)
+    target_link_libraries(${PROJECT_NAME} PRIVATE TracyGlfw3)
     endif()
 endif()
 
