@@ -16,11 +16,58 @@
 #include "RunQueue.hpp"
 #include "profiler/TracyConfig.hpp"
 
+#include <map>
+
 static struct arcan_shmif_cont C;
+static struct arcan_shmif_cont CIcon;
+static struct arcan_shmif_cont CClipboard;
+static struct arcan_shmif_cont CPaste;
+
 static uint8_t mouse_state[ASHMIF_MSTATE_SZ];
 
 static std::function<void()> s_redraw;
 static RunQueue* s_mainThreadTasks;
+static float s_scale = 1.0;
+static bool s_invisible = false;
+
+static std::map<ImGuiMouseCursor, const char*> s_cursorMap;
+
+static void buildCursorLUT()
+{
+	s_cursorMap[ImGuiMouseCursor_None] = "hidden";
+	s_cursorMap[ImGuiMouseCursor_Arrow] = "default";
+	s_cursorMap[ImGuiMouseCursor_TextInput] = "typefield";
+	s_cursorMap[ImGuiMouseCursor_Hand] = "grabhint";
+	s_cursorMap[ImGuiMouseCursor_ResizeNS] = "north-south";
+	s_cursorMap[ImGuiMouseCursor_ResizeEW] = "west-east";
+	s_cursorMap[ImGuiMouseCursor_ResizeAll] = "sizeall";
+	s_cursorMap[ImGuiMouseCursor_NotAllowed] = "forbidden";
+}
+
+static void onClipboardText(void* ud, const char* text)
+{
+
+}
+
+static const char* onPasteboardText(void* ud)
+{
+	return "missing";
+}
+
+static void sendCursor(const char* cursor)
+{
+   static const char* last_cursor;
+	 if (cursor == last_cursor)
+		 return;
+
+	 last_cursor = cursor;
+   arcan_event ev;
+ 	 memset(&ev, '\0', sizeof(struct arcan_event));
+	 ev.category = EVENT_EXTERNAL;
+	 ev.ext.kind = EVENT_EXTERNAL_CURSORHINT;
+   snprintf((char*)ev.ext.message.data, sizeof(ev.ext.message.data), "%s", cursor);
+	 arcan_shmif_enqueue(&C, &ev);
+}
 
 /* regular SDL2 sym to imgui key lut */
 static ImGuiKey keysymToImGui(int sym)
@@ -162,9 +209,16 @@ Backend::Backend( const char* title, const std::function<void()>& redraw, const 
 		C.hints |= SHMIF_RHINT_ORIGO_LL | SHMIF_RHINT_VSIGNAL_EV;
 		arcan_shmif_resize(&C, C.w, C.h);
 
+		buildCursorLUT();
 		s_mainThreadTasks = mainThreadTasks;
 		s_redraw = redraw;
-    ImGui_ImplOpenGL3_Init( "#version 150" );
+ 		ImGuiIO& io = ImGui::GetIO();
+		io.SetClipboardTextFn = onClipboardText;
+		io.GetClipboardTextFn = onPasteboardText;
+    io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+		io.BackendFlags |= ImGuiBackendFlags_HasSetMousePos;
+
+		ImGui_ImplOpenGL3_Init( "#version 150" );
 }
 
 Backend::~Backend()
@@ -180,6 +234,7 @@ void Backend::Show()
 
 static bool process_event(struct arcan_event& ev)
 {
+    bool rv = false;
     if (ev.category == EVENT_IO){
 		    ImGuiIO& io = ImGui::GetIO();
 
@@ -223,13 +278,29 @@ static bool process_event(struct arcan_event& ev)
 		    return true;
 		break;
 /* for Fonthint we need to special-case building Arcan so that we get
- * to call LoadFontFromCompressed rather than the built-in one */
+ * to call LoadFontFromCompressed rather than the built-in one and then convert [2].fv from mm to pt */
     case TARGET_COMMAND_FONTHINT:
 		break;
 		case TARGET_COMMAND_NEWSEGMENT:
-/* for icon and clipboard */
+/* for icon and clipboard,
+ * check ioevs[1] == 0 && ioevs[2].iv == SEGID_CURSOR or SEGID_CLIPBOARD / SEGID_CLIPBOARD_PASTE */
 		break;
 		case TARGET_COMMAND_DISPLAYHINT:
+        if (ev.tgt.ioevs[0].iv && ev.tgt.ioevs[1].iv){
+				    if (ev.tgt.ioevs[0].iv != C.w || ev.tgt.ioevs[1].iv != C.h){
+						    arcan_shmif_resize(&C, ev.tgt.ioevs[0].iv, ev.tgt.ioevs[1].iv);
+								rv = true;
+								tracy::s_wasActive = true;
+						}
+				    if (ev.tgt.ioevs[4].fv){
+						    s_scale = 38.4 / ev.tgt.ioevs[4].fv;
+						}
+						if (ev.tgt.ioevs[2].iv & 2){
+								s_invisible = true;
+						}
+						else
+								s_invisible = false;
+				}
 /* ppcm size and focus changes.
  * for resize, just _resize and return true.
  * for focus: AddFocusEvent(true | false)
@@ -239,7 +310,7 @@ static bool process_event(struct arcan_event& ev)
 		default:
 		break;
 		}
-    return false;
+    return rv;
 }
 
 void Backend::Run()
@@ -251,19 +322,17 @@ void Backend::Run()
 		bool dirty = false;
 
 		while (arcan_shmif_signalstatus(&C) != -1){
-		    unsigned ts = 16;
+		    unsigned ts = 4;
 				arcan_shmif_lock(&C); /* lock so that file picker won't race us */
 		    if (arcan_shmif_wait_timed(&C, &ts, &ev) > 0){
 				    dirty |= process_event(ev);
     		    while ((pv = arcan_shmif_poll(&C, &ev)) > 0){
 	    			    dirty |= process_event(ev);
 		        }
-				    if (dirty){
-				        /*tracy::s_wasActive = true;*/
-				    }
 				}
 				arcan_shmif_unlock(&C);
-				s_redraw();
+				if (!s_invisible)
+					s_redraw();
 				s_mainThreadTasks->Run();
 		}
 }
@@ -289,6 +358,11 @@ void Backend::NewFrame(int &w, int& h)
 
 	ImGuiIO& io = ImGui::GetIO();
 	io.DisplaySize = ImVec2(C.w, C.h);
+	ImGuiMouseCursor cursor = ImGui::GetMouseCursor();
+	const char* ctag = s_cursorMap[cursor];
+	if (ctag){
+		sendCursor(ctag);
+	}
 	ImGui_ImplOpenGL3_NewFrame();
 }
 
@@ -317,5 +391,5 @@ void Backend::SetTitle(const char* title)
 
 float Backend::GetDpiScale()
 {
-	return 1.0;
+	return s_scale;
 }
