@@ -29,6 +29,10 @@ static std::function<void()> s_redraw;
 static RunQueue* s_mainThreadTasks;
 static float s_scale = 1.0;
 static bool s_invisible = false;
+static struct {
+	uint8_t* data;
+	int w, h;
+} s_icon;
 
 static std::map<ImGuiMouseCursor, const char*> s_cursorMap;
 
@@ -44,14 +48,55 @@ static void buildCursorLUT()
 	s_cursorMap[ImGuiMouseCursor_NotAllowed] = "forbidden";
 }
 
+static struct arcan_event eventFactory(enum ARCAN_EVENT_EXTERNAL kind)
+{
+	struct arcan_event ret;
+	memset(&ret, '\0', sizeof(ret));
+	ret.category = EVENT_EXTERNAL;
+	ret.ext.kind = kind;
+	return ret;
+}
+
 static void onClipboardText(void* ud, const char* text)
 {
-
+ 		struct arcan_event ev = eventFactory(EVENT_EXTERNAL_MESSAGE);
+    arcan_shmif_pushutf8(&CClipboard, &ev, text, strlen(text) + 1);
 }
 
 static const char* onPasteboardText(void* ud)
 {
-	return "missing";
+		static std::string s;
+		static bool complete;
+    struct arcan_event ev;
+		int status;
+
+	  /* ignore other object types (e.g. cut and paste files etc.) */
+		while ((status = arcan_shmif_poll(&CPaste, &ev)) > 0){
+			if (ev.category == EVENT_TARGET && ev.tgt.kind == TARGET_COMMAND_MESSAGE){
+				if (complete){ /* forget the previous one */
+					complete = false;
+					s = "";
+				}
+
+				s = s + static_cast<char*>(ev.tgt.message);
+				complete = ev.tgt.ioevs[0].iv == 0;
+			}
+		}
+
+		if (-1 == status && CPaste.addr){
+			arcan_shmif_drop(&CPaste);
+		}
+
+		return complete ? s.c_str() : NULL;
+}
+
+static void requestSegment(enum ARCAN_SEGID id, int w, int h)
+{
+		arcan_event segreq = eventFactory(EVENT_EXTERNAL_SEGREQ);
+		segreq.ext.segreq.kind = id;
+		segreq.ext.segreq.width = w;
+		segreq.ext.segreq.height = h;
+		arcan_shmif_enqueue(&C, &segreq);
 }
 
 static void sendCursor(const char* cursor)
@@ -61,10 +106,7 @@ static void sendCursor(const char* cursor)
 		 return;
 
 	 last_cursor = cursor;
-   arcan_event ev;
- 	 memset(&ev, '\0', sizeof(struct arcan_event));
-	 ev.category = EVENT_EXTERNAL;
-	 ev.ext.kind = EVENT_EXTERNAL_CURSORHINT;
+   arcan_event ev = eventFactory(EVENT_EXTERNAL_CURSORHINT);
    snprintf((char*)ev.ext.message.data, sizeof(ev.ext.message.data), "%s", cursor);
 	 arcan_shmif_enqueue(&C, &ev);
 }
@@ -186,50 +228,20 @@ static ImGuiKey keysymToImGui(int sym)
     return ImGuiKey_None;
 }
 
-Backend::Backend( const char* title, const std::function<void()>& redraw, const std::function<void(float)>& scaleChanged, const std::function<int(void)>& isBusy, RunQueue* mainThreadTasks )
+static void synchIcon()
 {
-/* open, go to ext, set version 3, 2, CORE_PROFILE, FORWARD_COMPAT */
-		C = arcan_shmif_open(SEGID_MEDIA, SHMIF_ACQUIRE_FATALFAIL, NULL);
+    if (!CIcon.addr)
+		    return;
 
-		struct arcan_shmifext_setup opts = arcan_shmifext_defaults(&C);
-    arcan_shmif_mousestate_setup(&C, false, mouse_state);
-		arcan_shmif_setprimary(SHMIF_INPUT, &C);
-
-		opts.major = 3;
-		opts.minor = 2;
-		opts.builtin_fbo = 1;
-    opts.mask = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT;
-    enum shmifext_setup_status status = arcan_shmifext_setup(&C, opts);
-    if (SHMIFEXT_OK != status){
-		    fprintf(stderr, "Couldn't extend context to EGL/GL32\n");
-				exit(EXIT_FAILURE);
+		arcan_shmif_resize(&CIcon, s_icon.w, s_icon.h);
+		for (size_t y = 0; y < s_icon.h && y < CIcon.h; y++){
+			for (size_t x = 0; x < s_icon.w && x < CIcon.w; x++){
+				uint8_t* base = &s_icon.data[(y * s_icon.w + x) * 4];
+				CIcon.vidp[y * CIcon.pitch + x] =
+					SHMIF_RGBA(base[0], base[1], base[2], base[3]);
+			}
 		}
-		arcan_shmifext_make_current(&C);
-
-		C.hints |= SHMIF_RHINT_ORIGO_LL | SHMIF_RHINT_VSIGNAL_EV;
-		arcan_shmif_resize(&C, C.w, C.h);
-
-		buildCursorLUT();
-		s_mainThreadTasks = mainThreadTasks;
-		s_redraw = redraw;
- 		ImGuiIO& io = ImGui::GetIO();
-		io.SetClipboardTextFn = onClipboardText;
-		io.GetClipboardTextFn = onPasteboardText;
-    io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
-		io.BackendFlags |= ImGuiBackendFlags_HasSetMousePos;
-
-		ImGui_ImplOpenGL3_Init( "#version 150" );
-}
-
-Backend::~Backend()
-{
-    ImGui_ImplOpenGL3_Shutdown();
-    arcan_shmif_drop(&C);
-}
-
-void Backend::Show()
-{
-/* not needed, comes with signal */
+		arcan_shmif_signal(&CIcon, SHMIF_SIGVID | SHMIF_SIGBLK_NONE);
 }
 
 static bool process_event(struct arcan_event& ev)
@@ -241,16 +253,22 @@ static bool process_event(struct arcan_event& ev)
 		    if (ev.io.devkind == EVENT_IDEVKIND_MOUSE){
 				    if (ev.io.datatype == EVENT_IDATATYPE_ANALOG){
 						    int x, y;
-						    if (arcan_shmif_mousestate(&C, mouse_state, &ev, &x, &y)){
-								    io.AddMousePosEvent(x, y);
+								if (ev.io.subid == MBTN_WHEEL_UP_IND){
+									io.AddMouseWheelEvent(ev.io.input.analog.axisval[0], ev.io.input.analog.axisval[1]);
 								}
-								else {
-									/* subid for wheel should map to:
-									 * io.AddMouseWheelEvent */
+								else if (arcan_shmif_mousestate(&C, mouse_state, &ev, &x, &y)){
+								    io.AddMousePosEvent(x, y);
 								}
 						}
 						else if (ev.io.datatype == EVENT_IDATATYPE_DIGITAL){
-						    io.AddMouseButtonEvent(ev.io.subid - 1, ev.io.input.digital.active);
+							if (ev.io.subid == MBTN_WHEEL_UP_IND){
+								io.AddMouseWheelEvent(-8, 0);
+							}
+							else if (ev.io.subid == MBTN_WHEEL_DOWN_IND){
+								io.AddMouseWheelEvent(8, 0);
+							}
+							else
+								io.AddMouseButtonEvent(ev.io.subid - 1, ev.io.input.digital.active);
 						}
 				}
 				else if (ev.io.devkind == EVENT_IDEVKIND_KEYBOARD){
@@ -281,9 +299,27 @@ static bool process_event(struct arcan_event& ev)
  * to call LoadFontFromCompressed rather than the built-in one and then convert [2].fv from mm to pt */
     case TARGET_COMMAND_FONTHINT:
 		break;
+		case TARGET_COMMAND_RESET:
+			requestSegment(SEGID_ICON, 256, 256);
+			requestSegment(SEGID_CLIPBOARD, 0, 0);
+		break;
 		case TARGET_COMMAND_NEWSEGMENT:
-/* for icon and clipboard,
- * check ioevs[1] == 0 && ioevs[2].iv == SEGID_CURSOR or SEGID_CLIPBOARD / SEGID_CLIPBOARD_PASTE */
+		    if (ev.tgt.ioevs[2].iv == SEGID_CLIPBOARD){
+					if (CClipboard.addr)
+						arcan_shmif_drop(&CPaste);
+					CClipboard = arcan_shmif_acquire(&C, NULL, SEGID_CLIPBOARD, SHMIF_DISABLE_GUARD);
+				}
+				else if (ev.tgt.ioevs[2].iv == SEGID_ICON){
+					if (CIcon.addr)
+						arcan_shmif_drop(&CIcon);
+					CIcon = arcan_shmif_acquire(&C, NULL, SEGID_ICON, SHMIF_DISABLE_GUARD);
+				  synchIcon();
+				}
+				else if (ev.tgt.ioevs[2].iv == SEGID_CLIPBOARD_PASTE){
+					if (CPaste.addr)
+						arcan_shmif_drop(&CPaste);
+					CPaste = arcan_shmif_acquire(&C, NULL, SEGID_CLIPBOARD_PASTE, SHMIF_DISABLE_GUARD);
+				}
 		break;
 		case TARGET_COMMAND_DISPLAYHINT:
         if (ev.tgt.ioevs[0].iv && ev.tgt.ioevs[1].iv){
@@ -313,6 +349,58 @@ static bool process_event(struct arcan_event& ev)
     return rv;
 }
 
+Backend::Backend( const char* title, const std::function<void()>& redraw, const std::function<void(float)>& scaleChanged, const std::function<int(void)>& isBusy, RunQueue* mainThreadTasks )
+{
+		C = arcan_shmif_open(SEGID_APPLICATION, SHMIF_ACQUIRE_FATALFAIL, NULL);
+
+		/* setup connection and mark as primary so the file-picker parts can reach us */
+		struct arcan_shmifext_setup opts = arcan_shmifext_defaults(&C);
+    arcan_shmif_mousestate_setup(&C, false, mouse_state);
+		arcan_shmif_setprimary(SHMIF_INPUT, &C);
+
+		/* extend to GL3.2 */
+		opts.major = 3;
+		opts.minor = 2;
+		opts.builtin_fbo = 1;
+    opts.mask = EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT;
+    enum shmifext_setup_status status = arcan_shmifext_setup(&C, opts);
+    if (SHMIFEXT_OK != status){
+		    fprintf(stderr, "Couldn't extend context to EGL/GL32\n");
+				arcan_shmif_last_words(&C, "Accelerated graphics unavailable");
+				exit(EXIT_FAILURE);
+		}
+
+		/* since it's GL-FBO we have LL origo and we latch on STEPFRAME */
+		arcan_shmifext_make_current(&C);
+		C.hints |= SHMIF_RHINT_ORIGO_LL | SHMIF_RHINT_VSIGNAL_EV;
+		arcan_shmif_resize(&C, C.w, C.h);
+
+		requestSegment(SEGID_ICON, 256, 256);
+		requestSegment(SEGID_CLIPBOARD, 32, 32);
+
+		buildCursorLUT();
+		s_mainThreadTasks = mainThreadTasks;
+		s_redraw = redraw;
+ 		ImGuiIO& io = ImGui::GetIO();
+		io.SetClipboardTextFn = onClipboardText;
+		io.GetClipboardTextFn = onPasteboardText;
+    io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+		io.BackendFlags |= ImGuiBackendFlags_HasSetMousePos;
+
+		ImGui_ImplOpenGL3_Init( "#version 150" );
+}
+
+Backend::~Backend()
+{
+    ImGui_ImplOpenGL3_Shutdown();
+    arcan_shmif_drop(&C);
+}
+
+void Backend::Show()
+{
+/* not needed, comes with signal */
+}
+
 void Backend::Run()
 {
 /* poll events, on stepframe do this */
@@ -339,10 +427,7 @@ void Backend::Run()
 
 void Backend::Attention()
 {
-    arcan_event ev;
-		memset(&ev, '\0', sizeof(struct arcan_event));
-		ev.category = EVENT_EXTERNAL;
-		ev.ext.kind = EVENT_EXTERNAL_ALERT;
+    arcan_event ev = eventFactory(EVENT_EXTERNAL_ALERT);
 		arcan_shmif_enqueue(&C, &ev);
 }
 
@@ -376,17 +461,15 @@ void Backend::EndFrame()
 
 void Backend::SetIcon(uint8_t* data, int w, int h)
 {
-/* if icon subsegment is there, forward */
+    s_icon.data = data;
+		s_icon.w = w;
+		s_icon.h = h;
 }
 
 void Backend::SetTitle(const char* title)
 {
-	arcan_event ev;
-	memset(&ev, '\0', sizeof(struct arcan_event));
-	ev.category = EVENT_EXTERNAL;
-	ev.ext.kind = EVENT_EXTERNAL_IDENT;
-	snprintf((char*)ev.ext.message.data, sizeof(ev.ext.message.data), "%s", title);
-	arcan_shmif_enqueue(&C, &ev);
+	arcan_event ev = eventFactory(EVENT_EXTERNAL_IDENT);
+	arcan_shmif_pushutf8(&C, &ev, title, strlen(title) + 1);
 }
 
 float Backend::GetDpiScale()
